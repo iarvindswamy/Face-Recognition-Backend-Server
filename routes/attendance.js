@@ -484,21 +484,29 @@ router.post('/recognize', verifyToken, async (req, res) => {
   }
 });
 
+// REPLACE your /recognize-multiple endpoint in routes/attendance.js with this:
+
 router.post('/recognize-multiple', verifyToken, async (req, res) => {
   let { images, department, section, year } = req.body;
   const db = req.app.locals.db;
 
   try {
+    // Validate input
     if (!images || !Array.isArray(images) || images.length === 0) {
-      return res.status(400).json({ error: 'At least one image is required' });
+      return res.status(400).json({ 
+        success: false,
+        error: 'At least one image is required' 
+      });
     }
 
+    // Normalize case
     department = String(department).toUpperCase();
     section = String(section).toUpperCase();
     year = String(year).toUpperCase();
 
-    console.log(`\n=== Multi-Image Recognition ===`);
-    console.log(`Processing ${images.length} images for ${department}-${section}-${year}`);
+    console.log(`\n=== Multi-Image Recognition Started ===`);
+    console.log(`Images: ${images.length}`);
+    console.log(`Class: ${department}-${section}-${year}`);
 
     // 1️⃣ Get registered students
     const studentsResult = await db.query(
@@ -512,7 +520,8 @@ router.post('/recognize-multiple', verifyToken, async (req, res) => {
 
     if (studentsResult.rows.length === 0) {
       return res.status(400).json({ 
-        error: 'No registered students found for this class' 
+        success: false,
+        error: `No registered students found for ${department}-${section}-${year}` 
       });
     }
 
@@ -528,9 +537,9 @@ router.post('/recognize-multiple', verifyToken, async (req, res) => {
 
     console.log(`Found ${registeredStudents.length} registered students`);
 
-    // 2️⃣ Send ALL images to ML service in ONE call
-    console.log(`Sending ${images.length} images to ML service...`);
-    
+    // 2️⃣ Call ML service
+    console.log(`Calling ML service: ${ML_SERVICE_URL}/recognize_faces_multiple`);
+
     const mlResponse = await axios.post(
       `${ML_SERVICE_URL}/recognize_faces_multiple`,
       {
@@ -538,66 +547,121 @@ router.post('/recognize-multiple', verifyToken, async (req, res) => {
         registered_students: registeredStudents
       },
       {
-        timeout: 60000, // 60 second timeout for multiple images
+        timeout: 90000, // 90 seconds
         headers: {
           'Content-Type': 'application/json'
         }
       }
     );
 
-    if (!mlResponse.data.success) {
+    console.log('ML service response received');
+
+    // 3️⃣ Check response
+    if (!mlResponse.data || !mlResponse.data.success) {
+      console.error('ML service returned failure:', mlResponse.data);
       return res.status(400).json({
-        error: mlResponse.data.error || 'Recognition failed'
+        success: false,
+        error: mlResponse.data?.message || 'ML service failed'
       });
     }
 
-    // 3️⃣ Process results from ML service
     const results = mlResponse.data.results || [];
-    
-    // Merge and de-duplicate results across all images
+    console.log(`ML service returned ${results.length} results`);
+
+    // 4️⃣ Merge and deduplicate
     const recognizedMap = new Map();
     let totalFacesDetected = 0;
     let duplicatesFiltered = 0;
-    let lowQualityFaces = 0;
 
-    results.forEach((result, imageIndex) => {
-      totalFacesDetected += result.faces_detected || 0;
-      lowQualityFaces += result.low_quality_faces || 0;
+    results.forEach((result, idx) => {
+      const faces = result.faces_detected || 0;
+      const recognized = result.recognized_students || [];
 
-      const recognizedInImage = result.recognized_students || [];
-      
-      console.log(`Image ${imageIndex + 1}: ${result.faces_detected} faces, ${recognizedInImage.length} recognized`);
+      totalFacesDetected += faces;
 
-      recognizedInImage.forEach(student => {
-        const studentId = student.student_id;
-        const confidence = student.confidence || 0;
+      console.log(`\nImage ${idx + 1}:`);
+      console.log(`  Faces detected: ${faces}`);
+      console.log(`  Students recognized: ${recognized.length}`);
 
-        if (recognizedMap.has(studentId)) {
-          // Student already recognized in previous image
+      recognized.forEach(student => {
+        const sid = student.student_id;
+        const conf = student.confidence || 0;
+
+        if (recognizedMap.has(sid)) {
           duplicatesFiltered++;
-          console.log(`  ⚠ Duplicate: ${studentId}`);
+          console.log(`  ⚠ Duplicate: ${sid} (keeping best)`);
 
-          // Keep the one with higher confidence
-          const existing = recognizedMap.get(studentId);
-          if (confidence > existing.confidence) {
-            recognizedMap.set(studentId, {
-              student_id: studentId,
+          const existing = recognizedMap.get(sid);
+          if (conf > existing.confidence) {
+            recognizedMap.set(sid, {
+              student_id: sid,
               student_name: student.name,
-              confidence: confidence
+              confidence: conf
             });
-            console.log(`    → Updated with better confidence: ${(confidence * 100).toFixed(1)}%`);
           }
         } else {
-          // First time recognizing this student
-          recognizedMap.set(studentId, {
-            student_id: studentId,
+          recognizedMap.set(sid, {
+            student_id: sid,
             student_name: student.name,
-            confidence: confidence
+            confidence: conf
           });
-          console.log(`  ✓ Recognized: ${studentId} - ${student.name} (${(confidence * 100).toFixed(1)}%)`);
+          console.log(`  ✓ Recognized: ${sid} - ${student.name} (${(conf * 100).toFixed(1)}%)`);
         }
       });
     });
+
+    const recognizedStudents = Array.from(recognizedMap.values());
+
+    console.log(`\n=== Summary ===`);
+    console.log(`Total faces: ${totalFacesDetected}`);
+    console.log(`Unique students: ${recognizedStudents.length}`);
+    console.log(`Duplicates filtered: ${duplicatesFiltered}`);
+    console.log(`===============\n`);
+
+    // 5️⃣ Send response
+    res.json({
+      success: true,
+      images_processed: images.length,
+      total_faces_detected: totalFacesDetected,
+      unique_faces_detected: recognizedStudents.length,
+      recognized_students: recognizedStudents,
+      recognized_count: recognizedStudents.length,
+      duplicates_filtered: duplicatesFiltered,
+      unrecognized_faces: Math.max(0, totalFacesDetected - recognizedStudents.length)
+    });
+
+  } catch (error) {
+    console.error('\n❌ ERROR in recognize-multiple:');
+    console.error('Message:', error.message);
+    
+    if (error.response) {
+      console.error('ML Service Status:', error.response.status);
+      console.error('ML Service Data:', error.response.data);
+    }
+
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(503).json({
+        success: false,
+        error: 'Cannot connect to ML service',
+        details: 'ML service may be down or URL is incorrect'
+      });
+    }
+
+    if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        success: false,
+        error: 'ML service timeout',
+        details: 'Processing took too long. Try with fewer images.'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Failed to recognize faces (multi-image)',
+      details: error.message
+    });
+  }
+});
 
     // 4️⃣ Convert Map to array
     const recognizedStudents = Array.from(recognizedMap.values());
