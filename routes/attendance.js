@@ -410,413 +410,181 @@
 //     }
 //   }
 // });
-
 const express = require('express');
 const axios = require('axios');
 const PDFDocument = require('pdfkit');
 const moment = require('moment');
 const { verifyToken } = require('./auth');
+
 const router = express.Router();
 
-const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://localhost:5001';
+const ML_SERVICE_URL =
+  process.env.ML_SERVICE_URL || 'http://localhost:5001';
+
+/* =========================================================
+   SINGLE IMAGE RECOGNITION
+========================================================= */
 router.post('/recognize', verifyToken, async (req, res) => {
-  let { image, department, section, year } = req.body;
-  const db = req.app.locals.db;
-
   try {
-    // Normalize case only
-    department = String(department).toUpperCase();
-    section = String(section).toUpperCase();
-    year = String(year).toUpperCase(); // KEEP YEAR-4 AS IS
+    let { image, department, section, year } = req.body;
+    const db = req.app.locals.db;
 
-    console.log(`Recognition request → dept=${department}, section=${section}, year=${year}`);
+    department = department.toUpperCase();
+    section = section.toUpperCase();
+    year = year.toUpperCase();
 
     const studentsResult = await db.query(
-      `SELECT student_id, name, email, department, section, year, face_encoding
+      `SELECT student_id, name, face_encoding
        FROM students
-       WHERE UPPER(department) = UPPER($1)
-         AND UPPER(section) = UPPER($2)
-         AND UPPER(year) = UPPER($3)`,
+       WHERE UPPER(department)=$1
+         AND UPPER(section)=$2
+         AND UPPER(year)=$3`,
       [department, section, year]
     );
 
     if (studentsResult.rows.length === 0) {
-      return res.status(400).json({ error: 'No registered students found for this class' });
+      return res.status(400).json({ error: 'No students found' });
     }
 
     const registeredStudents = studentsResult.rows.map(s => ({
       student_id: s.student_id,
       name: s.name,
-      email: s.email,
-      department: s.department,
-      section: s.section,
-      year: s.year,
       face_encoding: JSON.parse(s.face_encoding)
     }));
 
-    console.log(`Registered students found: ${registeredStudents.length}`);
+    const mlResponse = await axios.post(
+      `${ML_SERVICE_URL}/recognize_faces`,
+      { image, registered_students: registeredStudents },
+      { timeout: 60000 }
+    );
 
-    const mlResponse = await axios.post(`${ML_SERVICE_URL}/recognize_faces`, {
-      image,
-      registered_students: registeredStudents
-    });
-
-    if (!mlResponse.data.success) {
-      return res.status(400).json({ error: mlResponse.data.error || 'Recognition failed' });
-    }
-
-    res.json({
-      success: true,
-      faces_detected: mlResponse.data.faces_detected || 0,
-      recognized_count: mlResponse.data.recognized_students?.length || 0,
-      recognized_students: mlResponse.data.recognized_students || [],
-      unrecognized_faces: mlResponse.data.unrecognized_faces || 0
-    });
-
+    res.json(mlResponse.data);
 
   } catch (error) {
-    console.error('Recognition error:', error);
-    if (error.response?.data) {
-      res.status(400).json({ error: error.response.data.error || 'Recognition failed' });
-    } else {
-      res.status(500).json({ error: 'Failed to recognize faces: ' + error.message });
-    }
+    console.error('Recognize error:', error.message);
+    res.status(500).json({ error: 'Face recognition failed' });
   }
 });
 
-// REPLACE your /recognize-multiple endpoint in routes/attendance.js with this:
-
+/* =========================================================
+   MULTI IMAGE RECOGNITION  ✅ FIXED
+========================================================= */
 router.post('/recognize-multiple', verifyToken, async (req, res) => {
-  let { images, department, section, year } = req.body;
-  const db = req.app.locals.db;
-
   try {
-    // Validate input
-    if (!images || !Array.isArray(images) || images.length === 0) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'At least one image is required' 
-      });
+    let { images, department, section, year } = req.body;
+    const db = req.app.locals.db;
+
+    if (!Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({ error: 'Images array required' });
     }
 
-    // Normalize case
-    department = String(department).toUpperCase();
-    section = String(section).toUpperCase();
-    year = String(year).toUpperCase();
+    department = department.toUpperCase();
+    section = section.toUpperCase();
+    year = year.toUpperCase();
 
-    console.log(`\n=== Multi-Image Recognition Started ===`);
-    console.log(`Images: ${images.length}`);
-    console.log(`Class: ${department}-${section}-${year}`);
-
-    // 1️⃣ Get registered students
     const studentsResult = await db.query(
-      `SELECT student_id, name, email, department, section, year, face_encoding
+      `SELECT student_id, name, face_encoding
        FROM students
-       WHERE UPPER(department) = UPPER($1)
-         AND UPPER(section) = UPPER($2)
-         AND UPPER(year) = UPPER($3)`,
+       WHERE UPPER(department)=$1
+         AND UPPER(section)=$2
+         AND UPPER(year)=$3`,
       [department, section, year]
     );
 
     if (studentsResult.rows.length === 0) {
-      return res.status(400).json({ 
-        success: false,
-        error: `No registered students found for ${department}-${section}-${year}` 
-      });
+      return res.status(400).json({ error: 'No students found' });
     }
 
     const registeredStudents = studentsResult.rows.map(s => ({
       student_id: s.student_id,
       name: s.name,
-      email: s.email,
-      department: s.department,
-      section: s.section,
-      year: s.year,
       face_encoding: JSON.parse(s.face_encoding)
     }));
-
-    console.log(`Found ${registeredStudents.length} registered students`);
-
-    // 2️⃣ Call ML service
-    console.log(`Calling ML service: ${ML_SERVICE_URL}/recognize_faces_multiple`);
 
     const mlResponse = await axios.post(
       `${ML_SERVICE_URL}/recognize_faces_multiple`,
       {
-        images: images,
+        images,
         registered_students: registeredStudents
       },
-      {
-        timeout: 90000, // 90 seconds
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      }
+      { timeout: 90000 }
     );
 
-    console.log('ML service response received');
-
-    // 3️⃣ Check response
-    if (!mlResponse.data || !mlResponse.data.success) {
-      console.error('ML service returned failure:', mlResponse.data);
+    if (!mlResponse.data.success) {
       return res.status(400).json({
-        success: false,
-        error: mlResponse.data?.message || 'ML service failed'
+        error: mlResponse.data.error || 'ML service failed'
       });
     }
 
-    const results = mlResponse.data.results || [];
-    console.log(`ML service returned ${results.length} results`);
-
-    // 4️⃣ Merge and deduplicate
     const recognizedMap = new Map();
-    let totalFacesDetected = 0;
-    let duplicatesFiltered = 0;
+    let totalFaces = 0;
 
-    results.forEach((result, idx) => {
-      const faces = result.faces_detected || 0;
-      const recognized = result.recognized_students || [];
+    mlResponse.data.results.forEach(r => {
+      totalFaces += r.faces_detected || 0;
 
-      totalFacesDetected += faces;
-
-      console.log(`\nImage ${idx + 1}:`);
-      console.log(`  Faces detected: ${faces}`);
-      console.log(`  Students recognized: ${recognized.length}`);
-
-      recognized.forEach(student => {
-        const sid = student.student_id;
-        const conf = student.confidence || 0;
-
-        if (recognizedMap.has(sid)) {
-          duplicatesFiltered++;
-          console.log(`  ⚠ Duplicate: ${sid} (keeping best)`);
-
-          const existing = recognizedMap.get(sid);
-          if (conf > existing.confidence) {
-            recognizedMap.set(sid, {
-              student_id: sid,
-              student_name: student.name,
-              confidence: conf
-            });
-          }
-        } else {
-          recognizedMap.set(sid, {
-            student_id: sid,
-            student_name: student.name,
-            confidence: conf
-          });
-          console.log(`  ✓ Recognized: ${sid} - ${student.name} (${(conf * 100).toFixed(1)}%)`);
+      (r.recognized_students || []).forEach(s => {
+        const existing = recognizedMap.get(s.student_id);
+        if (!existing || s.confidence > existing.confidence) {
+          recognizedMap.set(s.student_id, s);
         }
       });
     });
 
     const recognizedStudents = Array.from(recognizedMap.values());
 
-    console.log(`\n=== Summary ===`);
-    console.log(`Total faces: ${totalFacesDetected}`);
-    console.log(`Unique students: ${recognizedStudents.length}`);
-    console.log(`Duplicates filtered: ${duplicatesFiltered}`);
-    console.log(`===============\n`);
-
-    // 5️⃣ Send response
     res.json({
       success: true,
       images_processed: images.length,
-      total_faces_detected: totalFacesDetected,
-      unique_faces_detected: recognizedStudents.length,
-      recognized_students: recognizedStudents,
+      total_faces_detected: totalFaces,
       recognized_count: recognizedStudents.length,
-      duplicates_filtered: duplicatesFiltered,
-      unrecognized_faces: Math.max(0, totalFacesDetected - recognizedStudents.length)
+      recognized_students: recognizedStudents
     });
 
   } catch (error) {
-    console.error('\n❌ ERROR in recognize-multiple:');
-    console.error('Message:', error.message);
-    
-    if (error.response) {
-      console.error('ML Service Status:', error.response.status);
-      console.error('ML Service Data:', error.response.data);
-    }
+    console.error('recognize-multiple error:', error.message);
 
-    if (error.code === 'ECONNREFUSED') {
-      return res.status(503).json({
-        success: false,
-        error: 'Cannot connect to ML service',
-        details: 'ML service may be down or URL is incorrect'
-      });
-    }
-
-    if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+    if (error.code === 'ETIMEDOUT') {
       return res.status(504).json({
-        success: false,
-        error: 'ML service timeout',
-        details: 'Processing took too long. Try with fewer images.'
+        error: 'ML service timeout. Try fewer images.'
       });
     }
 
     res.status(500).json({
-      success: false,
       error: 'Failed to recognize faces (multi-image)',
       details: error.message
     });
   }
 });
 
-    // 4️⃣ Convert Map to array
-    const recognizedStudents = Array.from(recognizedMap.values());
-    const uniqueStudentsCount = recognizedStudents.length;
-
-    // 5️⃣ Log final results
-    console.log(`\n=== Recognition Complete ===`);
-    console.log(`Images processed: ${images.length}`);
-    console.log(`Total faces detected: ${totalFacesDetected}`);
-    console.log(`Low quality faces: ${lowQualityFaces}`);
-    console.log(`Unique students recognized: ${uniqueStudentsCount}`);
-    console.log(`Duplicates filtered: ${duplicatesFiltered}`);
-    console.log(`Unrecognized faces: ${totalFacesDetected - uniqueStudentsCount - lowQualityFaces}`);
-    console.log(`===========================\n`);
-
-    // 6️⃣ Send response
-    res.json({
-      success: true,
-      images_processed: images.length,
-      total_faces_detected: totalFacesDetected,
-      low_quality_faces: lowQualityFaces,
-      unique_faces_detected: uniqueStudentsCount,
-      recognized_students: recognizedStudents,
-      recognized_count: uniqueStudentsCount,
-      duplicates_filtered: duplicatesFiltered,
-      unrecognized_faces: Math.max(0, totalFacesDetected - uniqueStudentsCount - lowQualityFaces)
-    });
-
-  } catch (error) {
-    console.error('\n=== Recognition Error ===');
-    console.error('Error:', error.message);
-    
-    if (error.response) {
-      console.error('ML Service Status:', error.response.status);
-      console.error('ML Service Error:', error.response.data);
-    }
-    
-    console.error('========================\n');
-    
-    res.status(500).json({
-      success: false,
-      error: 'Failed to recognize faces (multi-image)',
-      details: error.response?.data?.error || error.message
-    });
-  }
-});
-
+/* =========================================================
+   MARK ATTENDANCE
+========================================================= */
 router.post('/mark', verifyToken, async (req, res) => {
-  const {
-    subject_id,
-    department,
-    section,
-    year,
-    session_date,
-    session_time,
-    period_number,
-    attendance_records
-  } = req.body;
-
-  const db = req.app.locals.db;
-
   try {
+    const {
+      subject_id,
+      department,
+      section,
+      year,
+      session_date,
+      session_time,
+      period_number,
+      attendance_records
+    } = req.body;
 
-    
-    // 1. Prevent duplicate attendance
-    const duplicateCheck = await db.query(
-      `SELECT id FROM attendance_sessions
-       WHERE department = $1
-         AND section = $2
-         AND year = $3
-         AND session_date = $4
-         AND period_number = $5`,
-      [department, section, year, session_date, period_number]
-    );
+    const db = req.app.locals.db;
 
-    if (duplicateCheck.rows.length > 0) {
-      return res.status(400).json({
-        error: `Attendance already marked for Period ${period_number} on ${session_date}`
-      });
-    }
-
-    // 2. Insert new attendance session
-    const sessionResult = await db.query(
-      `INSERT INTO attendance_sessions 
-        (subject_id, faculty_id, department, section, year, session_date, session_time, period_number)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id`,
-      [subject_id, req.user.id, department, section, year, session_date, session_time, period_number]
-    );
-
-    const sessionId = sessionResult.rows[0].id;
-
-    // 3. Insert records
-    const promises = attendance_records.map(r =>
-      db.query(
-        `INSERT INTO attendance_records (session_id, student_id, status, confidence_score)
-        VALUES ($1, $2, $3, $4)`,
-        [sessionId, r.student_id, r.status, r.confidence_score || null]
-      )
-    );
-
-    await Promise.all(promises);
-
-    res.json({ success: true, session_id: sessionId });
-  } catch (error) {
-    console.error('Attendance mark error:', error);
-    res.status(500).json({ error: 'Failed to mark attendance' });
-  }
-});
-
-router.post('/mark-multiple', verifyToken, async (req, res) => {
-  const {
-    subject_id,
-    department,
-    section,
-    year,
-    session_date,
-    session_time,
-    period_number,
-    recognized_students   // 👈 OUTPUT of recognize-multiple
-  } = req.body;
-
-  const db = req.app.locals.db;
-
-  try {
-    if (!recognized_students || !Array.isArray(recognized_students)) {
-      return res.status(400).json({
-        error: 'recognized_students array is required'
-      });
-    }
-
-    // 1️⃣ Prevent duplicate attendance
-    const duplicateCheck = await db.query(
+    const duplicate = await db.query(
       `SELECT id FROM attendance_sessions
        WHERE department=$1 AND section=$2 AND year=$3
          AND session_date=$4 AND period_number=$5`,
       [department, section, year, session_date, period_number]
     );
 
-    if (duplicateCheck.rows.length > 0) {
-      return res.status(400).json({
-        error: `Attendance already marked for Period ${period_number}`
-      });
+    if (duplicate.rows.length > 0) {
+      return res.status(400).json({ error: 'Attendance already marked' });
     }
 
-    // 2️⃣ Fetch all students in class
-    const studentsResult = await db.query(
-      `SELECT student_id FROM students
-       WHERE UPPER(department)=UPPER($1)
-         AND UPPER(section)=UPPER($2)
-         AND UPPER(year)=UPPER($3)`,
-      [department, section, year]
-    );
-
-    // 3️⃣ Insert session
     const sessionResult = await db.query(
       `INSERT INTO attendance_sessions
        (subject_id, faculty_id, department, section, year,
@@ -837,257 +605,22 @@ router.post('/mark-multiple', verifyToken, async (req, res) => {
 
     const sessionId = sessionResult.rows[0].id;
 
-    // 4️⃣ Create lookup of present students
-    const presentMap = new Map();
-    recognized_students.forEach(s => {
-      presentMap.set(s.student_id, s.confidence || null);
-    });
+    await Promise.all(
+      attendance_records.map(r =>
+        db.query(
+          `INSERT INTO attendance_records
+           (session_id, student_id, status, confidence_score)
+           VALUES ($1,$2,$3,$4)`,
+          [sessionId, r.student_id, r.status, r.confidence_score || null]
+        )
+      )
+    );
 
-    // 5️⃣ Insert attendance records
-    const insertPromises = studentsResult.rows.map(student => {
-      const isPresent = presentMap.has(student.student_id);
-
-      return db.query(
-        `INSERT INTO attendance_records
-         (session_id, student_id, status, confidence_score)
-         VALUES ($1,$2,$3,$4)`,
-        [
-          sessionId,
-          student.student_id,
-          isPresent ? 'present' : 'absent',
-          isPresent ? presentMap.get(student.student_id) : null
-        ]
-      );
-    });
-
-    await Promise.all(insertPromises);
-
-    res.json({
-      success: true,
-      session_id: sessionId,
-      present_count: presentMap.size,
-      total_students: studentsResult.rows.length
-    });
+    res.json({ success: true, session_id: sessionId });
 
   } catch (error) {
-    console.error('mark-multiple error:', error);
-    res.status(500).json({
-      error: 'Failed to mark attendance (multi-image)',
-      details: error.message
-    });
-  }
-});
-
-
-// Get all attendance sessions
-router.get('/sessions', verifyToken, async (req, res) => {
-  const db = req.app.locals.db;
-
-  try {
-    const result = await db.query(
-      `SELECT 
-        s.id,
-        s.department,
-        s.section,
-        s.session_date,
-        s.period_number,
-        s.created_at,
-        sub.subject_name AS course_name,
-        sub.subject_code AS subject_code,
-        u.username AS faculty_name,
-        COUNT(ar.id) FILTER (WHERE ar.status = 'present') AS present_count,
-        COUNT(ar.id) FILTER (WHERE ar.status = 'absent') AS absent_count,
-        COUNT(ar.id) AS total_count
-    FROM attendance_sessions s
-    LEFT JOIN subjects sub ON s.subject_id = sub.id
-    LEFT JOIN users u ON s.faculty_id = u.id
-    LEFT JOIN attendance_records ar ON s.id = ar.session_id
-    GROUP BY s.id, sub.subject_name, sub.subject_code, u.username
-    ORDER BY s.session_date DESC, s.session_time DESC;
-    `
-    );
-
-    res.json({ sessions: result.rows });
-  } catch (error) {
-    console.error('Error fetching sessions:', error);
-    res.status(500).json({ error: 'Failed to fetch sessions' });
-  }
-});
-
-// Get attendance details for a session
-router.get('/sessions/:session_id', verifyToken, async (req, res) => {
-  const { session_id } = req.params;
-  const db = req.app.locals.db;
-
-  try {
-    // Get session info
-    const sessionResult = await db.query(
-      `SELECT s.*, u.username as faculty_name,
-              sub.subject_name, sub.subject_code
-       FROM attendance_sessions s
-       LEFT JOIN users u ON s.faculty_id = u.id
-       LEFT JOIN subjects sub ON s.subject_id = sub.id
-       WHERE s.id = $1`,
-      [session_id]
-    );
-
-    if (sessionResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    // Get attendance records
-    const recordsResult = await db.query(
-      `SELECT 
-          ar.id,
-          ar.status,
-          st.student_id,
-          st.name,
-          st.department
-      FROM attendance_records ar
-      JOIN students st ON ar.student_id = st.student_id
-      WHERE ar.session_id = $1
-      ORDER BY st.student_id ASC`,
-      [session_id]
-    );
-
-
-    res.json({
-      session: sessionResult.rows[0],
-      records: recordsResult.rows
-    });
-  } catch (error) {
-    console.error('Error fetching session details:', error);
-    res.status(500).json({ error: 'Failed to fetch session details' });
-  }
-});
-
-// Generate PDF report
-router.get('/sessions/:session_id/pdf', verifyToken, async (req, res) => {
-  const { session_id } = req.params;
-  const db = req.app.locals.db;
-
-  try {
-    const sessionResult = await db.query(
-      `SELECT s.*, u.username as faculty_name, 
-              sub.subject_name, sub.subject_code
-       FROM attendance_sessions s
-       LEFT JOIN users u ON s.faculty_id = u.id
-       LEFT JOIN subjects sub ON s.subject_id = sub.id
-       WHERE s.id = $1`,
-      [session_id]
-    );
-
-    if (sessionResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    const session = sessionResult.rows[0];
-
-    const recordsResult = await db.query(
-      `SELECT 
-        ar.status,
-        st.student_id, st.name, st.email, st.department
-       FROM attendance_records ar
-       JOIN students st ON ar.student_id = st.student_id
-       WHERE ar.session_id = $1
-       ORDER BY st.name ASC`,
-      [session_id]
-    );
-
-    const doc = new PDFDocument({ margin: 50 });
-    
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=attendance_${session_id}.pdf`);
-    
-    doc.pipe(res);
-
-    doc.fontSize(20).text('Attendance Report', { align: 'center' });
-    doc.moveDown();
-    
-    doc.fontSize(12);
-    doc.text(`Subject: ${session.subject_name || 'N/A'} (${session.subject_code || 'N/A'})`);
-    doc.text(`Department: ${session.department || 'N/A'}`);
-    doc.text(`Section: ${session.section || 'N/A'}`);
-    doc.text(`Period: ${session.period_number || 'N/A'}`);
-    doc.text(`Date: ${session.session_date ? moment(session.session_date).format('MMMM Do YYYY') : 'N/A'}`);
-    doc.text(`Time: ${session.session_time || 'N/A'}`);
-    doc.text(`Faculty: ${session.faculty_name}`);
-    doc.moveDown();
-
-    const presentCount = recordsResult.rows.filter(r => r.status === 'present').length;
-    const absentCount = recordsResult.rows.filter(r => r.status === 'absent').length;
-    
-    doc.fontSize(14).text('Summary', { underline: true });
-    doc.fontSize(12);
-    doc.text(`Total Students: ${recordsResult.rows.length}`);
-    doc.text(`Present: ${presentCount}`);
-    doc.text(`Absent: ${absentCount}`);
-    doc.moveDown();
-
-    doc.fontSize(14).text('Attendance Details', { underline: true });
-    doc.moveDown(0.5);
-    
-    const tableTop = doc.y;
-    const col1X = 50;
-    const col2X = 200;
-    const col3X = 380;
-
-    doc.fontSize(10).font('Helvetica-Bold');
-    doc.text('Student ID', col1X, tableTop);
-    doc.text('Name', col2X, tableTop);
-    doc.text('Status', col3X, tableTop);
-
-    doc.moveTo(col1X, tableTop + 15).lineTo(550, tableTop + 15).stroke();
-    doc.moveDown();
-
-    doc.font('Helvetica');
-    let y = tableTop + 25;
-
-    recordsResult.rows.forEach((record) => {
-      if (y > 700) {
-        doc.addPage();
-        y = 50;
-      }
-
-      doc.text(record.student_id, col1X, y, { width: 120 });
-      doc.text(record.name, col2X, y, { width: 160 });
-      doc.text(record.status.toUpperCase(), col3X, y, { width: 100 });
-
-      y += 20;
-    });
-
-    doc.fontSize(8).text(
-      `Generated on ${moment().format('MMMM Do YYYY, h:mm:ss a')}`,
-      50,
-      750,
-      { align: 'center' }
-    );
-
-    doc.end();
-  } catch (error) {
-    console.error('Error generating PDF:', error);
-    res.status(500).json({ error: 'Failed to generate PDF' });
-  }
-});
-
-router.delete('/sessions/:session_id', verifyToken, async (req, res) => {
-  const { session_id } = req.params;
-  const db = req.app.locals.db;
-
-  try {
-    const result = await db.query(
-      'DELETE FROM attendance_sessions WHERE id = $1 RETURNING id',
-      [session_id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
-
-    res.json({ message: 'Session deleted successfully' });
-  } catch (error) {
-    console.error('Error delating session:', error);
-    res.status(500).json({ error: 'Failed to delete session' });
+    console.error('mark error:', error.message);
+    res.status(500).json({ error: 'Failed to mark attendance' });
   }
 });
 
